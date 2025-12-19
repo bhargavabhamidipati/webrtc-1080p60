@@ -1,0 +1,7 @@
+{
+  "name": "webrtc-1080p60",
+  "type": "module",
+  "dependencies": {
+    "ws": "^8.16.0"
+  }
+}

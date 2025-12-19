@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>P2P Screen Share (Host / Viewer)</title>
+
+  <style>
+    body {
+      margin: 0;
+      padding: 20px;
+      font-family: system-ui, sans-serif;
+      background: #0f172a;
+      color: #e5e7eb;
+    }
+
+    h2 { margin-bottom: 10px; }
+
+    .controls {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
+
+    input {
+      padding: 8px;
+      border-radius: 6px;
+      border: none;
+      width: 160px;
+    }
+
+    button {
+      padding: 8px 14px;
+      border-radius: 6px;
+      border: none;
+      cursor: pointer;
+      font-size: 14px;
+    }
+
+    .primary { background: #2563eb; color: white; }
+    .secondary { background: #374151; color: white; }
+    .danger { background: #dc2626; color: white; }
+
+    video {
+      width: 100%;
+      background: black;
+      border-radius: 12px;
+      margin-top: 10px;
+    }
+
+    .status {
+      margin-top: 8px;
+      font-size: 13px;
+      color: #9ca3af;
+    }
+
+    .metrics {
+      margin-top: 12px;
+      padding: 12px;
+      background: #020617;
+      border-radius: 10px;
+      font-size: 13px;
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 6px;
+    }
+
+    .metric {
+      color: #c7d2fe;
+    }
+
+    .label {
+      color: #9ca3af;
+    }
+  </style>
+</head>
+
+<body>
+
+<h2>🎥 P2P Screen Sharing (Host / Viewer)</h2>
+
+<div class="controls">
+  <input id="roomInput" placeholder="Room ID">
+  <button id="create" class="primary">▶ Start (Host)</button>
+  <button id="join" class="secondary">👀 Join</button>
+</div>
+
+<div class="controls">
+  <button id="toggleMic" class="secondary">🎤 Mute Mic</button>
+  <button id="stopShare" class="secondary">🛑 Stop Sharing</button>
+  <button id="fullscreen" class="secondary">🔳 Fullscreen</button>
+  <button id="stopAll" class="danger">⛔ Exit</button>
+</div>
+
+<video id="video" autoplay playsinline></video>
+
+<div class="metrics" id="metrics">
+  <div class="metric"><span class="label">Resolution:</span> <span id="res">-</span></div>
+  <div class="metric"><span class="label">FPS:</span> <span id="fps">-</span></div>
+  <div class="metric"><span class="label">Video bitrate:</span> <span id="vBitrate">-</span></div>
+  <div class="metric"><span class="label">Video packets lost:</span> <span id="vLost">-</span></div>
+  <div class="metric"><span class="label">Audio bitrate:</span> <span id="aBitrate">-</span></div>
+  <div class="metric"><span class="label">Audio packets lost:</span> <span id="aLost">-</span></div>
+  <div class="metric"><span class="label">RTT:</span> <span id="rtt">-</span></div>
+  <div class="metric"><span class="label">Jitter:</span> <span id="jitter">-</span></div>
+</div>
+
+<div class="status" id="status">Idle</div>
+
+<script>
+/* ================= GLOBAL ================= */
+
+const signaling = new WebSocket("ws://localhost:3000");
+
+const roomInput = document.getElementById("roomInput");
+const videoEl = document.getElementById("video");
+const statusEl = document.getElementById("status");
+
+const el = id => document.getElementById(id);
+
+let role = null;
+let localStream = null;
+let micTrack = null;
+let screenTrack = null;
+
+const peerConnections = {};
+let viewerPC = null;
+
+let lastStats = {};
+let statsInterval = null;
+
+function log(msg) {
+  statusEl.textContent = msg;
+}
+
+/* ================= HOST ================= */
+
+document.getElementById("create").onclick = async () => {
+  role = "host";
+  const roomId = roomInput.value.trim();
+  if (!roomId) return alert("Enter room ID");
+
+  signaling.send(JSON.stringify({ type: "create-room", roomId }));
+
+  const screenStream = await navigator.mediaDevices.getDisplayMedia({
+    video: true,
+    audio: true
+  });
+
+  const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+  screenTrack = screenStream.getVideoTracks()[0];
+  micTrack = micStream.getAudioTracks()[0];
+
+  localStream = new MediaStream([
+    screenTrack,
+    ...screenStream.getAudioTracks(),
+    micTrack
+  ]);
+
+  videoEl.srcObject = localStream;
+  videoEl.muted = true;
+
+  log("Sharing screen");
+};
+
+function createPeerConnection(viewerId) {
+  const pc = new RTCPeerConnection({
+    iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+  });
+
+  localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+
+  pc.onicecandidate = e => {
+    if (e.candidate) {
+      signaling.send(JSON.stringify({
+        type: "candidate",
+        target: viewerId,
+        candidate: e.candidate
+      }));
+    }
+  };
+
+  peerConnections[viewerId] = pc;
+  startStats(pc);
+  return pc;
+}
+
+/* ================= VIEWER ================= */
+
+document.getElementById("join").onclick = async () => {
+  role = "viewer";
+  const roomId = roomInput.value.trim();
+  if (!roomId) return alert("Enter room ID");
+
+  const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+  viewerPC = new RTCPeerConnection({
+    iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+  });
+
+  micStream.getTracks().forEach(t => viewerPC.addTrack(t, micStream));
+
+  viewerPC.ontrack = e => {
+    videoEl.srcObject = e.streams[0];
+  };
+
+  viewerPC.onicecandidate = e => {
+    if (e.candidate) {
+      signaling.send(JSON.stringify({ type: "candidate", candidate: e.candidate }));
+    }
+  };
+
+  signaling.send(JSON.stringify({ type: "join-room", roomId }));
+  startStats(viewerPC);
+};
+
+/* ================= SIGNALING ================= */
+
+signaling.onmessage = async msg => {
+  const data = JSON.parse(msg.data);
+
+  if (data.type === "viewer-joined" && role === "host") {
+    const pc = createPeerConnection(data.viewerId);
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    signaling.send(JSON.stringify({ type: "offer", target: data.viewerId, offer }));
+  }
+
+  else if (data.type === "offer" && role === "viewer") {
+    await viewerPC.setRemoteDescription(data.offer);
+    const answer = await viewerPC.createAnswer();
+    await viewerPC.setLocalDescription(answer);
+    signaling.send(JSON.stringify({ type: "answer", answer }));
+  }
+
+  else if (data.type === "answer" && role === "host") {
+    await peerConnections[data.viewerId].setRemoteDescription(data.answer);
+  }
+
+  else if (data.type === "candidate") {
+    if (role === "host") {
+      peerConnections[data.viewerId]?.addIceCandidate(data.candidate);
+    } else if (viewerPC?.remoteDescription) {
+      viewerPC.addIceCandidate(data.candidate);
+    }
+  }
+};
+
+/* ================= STATS ================= */
+
+function startStats(pc) {
+  if (statsInterval) return;
+
+  statsInterval = setInterval(async () => {
+    const stats = await pc.getStats();
+
+    stats.forEach(r => {
+      if (r.type === "inbound-rtp" && r.kind === "video") {
+        const last = lastStats[r.id];
+        if (last) {
+          const bitrate = 8 * (r.bytesReceived - last.bytesReceived);
+          el("vBitrate").textContent = Math.round(bitrate / 1000) + " kbps";
+        }
+        el("vLost").textContent = r.packetsLost;
+        lastStats[r.id] = r;
+      }
+
+      if (r.type === "inbound-rtp" && r.kind === "audio") {
+        const last = lastStats[r.id];
+        if (last) {
+          const bitrate = 8 * (r.bytesReceived - last.bytesReceived);
+          el("aBitrate").textContent = Math.round(bitrate / 1000) + " kbps";
+        }
+        el("aLost").textContent = r.packetsLost;
+        lastStats[r.id] = r;
+      }
+
+      if (r.type === "track" && r.kind === "video") {
+        el("fps").textContent = r.framesPerSecond?.toFixed(1);
+        el("res").textContent = `${r.frameWidth}×${r.frameHeight}`;
+      }
+
+      if (r.type === "candidate-pair" && r.currentRoundTripTime) {
+        el("rtt").textContent = Math.round(r.currentRoundTripTime * 1000) + " ms";
+      }
+
+      if (r.jitter !== undefined) {
+        el("jitter").textContent = (r.jitter * 1000).toFixed(1) + " ms";
+      }
+    });
+  }, 1000);
+}
+
+/* ================= CONTROLS ================= */
+
+document.getElementById("stopShare").onclick = () => {
+  screenTrack?.stop();
+  log("Screen sharing stopped");
+};
+
+document.getElementById("fullscreen").onclick = () => {
+  document.fullscreenElement ? document.exitFullscreen() : videoEl.requestFullscreen();
+};
+
+document.getElementById("stopAll").onclick = () => {
+  localStream?.getTracks().forEach(t => t.stop());
+  Object.values(peerConnections).forEach(pc => pc.close());
+  viewerPC?.close();
+  clearInterval(statsInterval);
+  log("Exited");
+};
+</script>
+
+</body>
+</html>
