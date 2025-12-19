@@ -1,26 +1,34 @@
 import { WebSocketServer } from "ws";
+import http from "http";
+import fs from "fs";
 import crypto from "crypto";
 
-const wss = new WebSocketServer({ port: 3000 });
+const PORT = process.env.PORT || 3000;
+
+// HTTP server (serves index.html)
+const server = http.createServer((req, res) => {
+  if (req.url === "/" || req.url === "/index.html") {
+    const html = fs.readFileSync("./index.html");
+    res.writeHead(200, { "Content-Type": "text/html" });
+    res.end(html);
+  }
+});
+
+const wss = new WebSocketServer({ server });
+
 const rooms = {}; 
-// rooms[roomId] = { host: ws, viewers: Map<viewerId, ws> }
+// rooms[roomId] = { host: ws, viewers: Map }
 
 wss.on("connection", ws => {
   ws.on("message", raw => {
     const data = JSON.parse(raw);
 
-    // CREATE ROOM
     if (data.type === "create-room") {
-      rooms[data.roomId] = {
-        host: ws,
-        viewers: new Map()
-      };
+      rooms[data.roomId] = { host: ws, viewers: new Map() };
       ws.roomId = data.roomId;
       ws.role = "host";
-      console.log(`Room created: ${data.roomId}`);
     }
 
-    // JOIN ROOM
     else if (data.type === "join-room") {
       const room = rooms[data.roomId];
       if (!room) return;
@@ -38,14 +46,12 @@ wss.on("connection", ws => {
       }));
     }
 
-    // SIGNALING (targeted)
     else if (["offer", "answer", "candidate"].includes(data.type)) {
       const room = rooms[ws.roomId];
       if (!room) return;
 
       if (ws.role === "host") {
-        const viewer = room.viewers.get(data.target);
-        if (viewer) viewer.send(JSON.stringify(data));
+        room.viewers.get(data.target)?.send(JSON.stringify(data));
       } else {
         room.host.send(JSON.stringify({
           ...data,
@@ -61,11 +67,12 @@ wss.on("connection", ws => {
 
     if (ws.role === "host") {
       delete rooms[ws.roomId];
-      console.log(`Room closed: ${ws.roomId}`);
     } else {
       room.viewers.delete(ws.viewerId);
     }
   });
 });
 
-console.log("✅ Signaling server running on ws://localhost:3000");
+server.listen(PORT, () => {
+  console.log(`✅ Server running on port ${PORT}`);
+});

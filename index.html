@@ -110,7 +110,9 @@
 <script>
 /* ================= GLOBAL ================= */
 
-const signaling = new WebSocket("ws://localhost:3000");
+const signaling = new WebSocket(
+  (location.protocol === "https:" ? "wss://" : "ws://") + location.host
+);
 
 const roomInput = document.getElementById("roomInput");
 const videoEl = document.getElementById("video");
